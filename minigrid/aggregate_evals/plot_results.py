@@ -9,6 +9,12 @@ MODEL_COLORS = {
     'ppo': '#E74C3C',           # Red
     'ppo_reward_machine': '#1ABC9C',  # Teal
     'h_ppo_product': '#3498DB',  # Blue
+    'h_ppo_psm': '#5DADE2',  # Light blue
+    'h_ppo_psm_netembed': '#2E86C1',  # Darker blue
+    'h_ppo_kdloss': '#AF7AC5',  # Lavender
+    'h_ppo_kdloss_full': '#8E44AD',  # Deep lavender
+    'h_ppo_sym_kd': '#16A085',  # Green-teal
+    'h_ppo_sym_kl_loss': '#48C9B0',  # Light green-teal
     'h_ppo_symloss': '#F39C12',  # Orange
     'h_ppo_symloss_eps': '#2ECC71',  # Green
     'h_ppo_symloss_theta': '#9B59B6',  # Purple
@@ -19,12 +25,36 @@ MODEL_ORDER = [
     ('ppo_', 0),  # ppo_ to avoid matching h_ppo
     ('ppo_reward_machine', 1),
     ('h_ppo_product', 2),
-    ('h_ppo_symloss_eps', 4),  # eps before plain symloss in check order
-    ('theta_0.25', 5),
-    ('theta_0.5', 6),
-    ('theta_0.75', 7),
-    ('h_ppo_symloss', 3),  # plain symloss last in checks (after theta/eps)
+    ('h_ppo_psm', 3),
+    ('h_ppo_psm_netembed', 4),
+    ('h_ppo_kdloss', 5),
+    ('h_ppo_kdloss_full', 6),
+    ('h_ppo_sym_kd', 7),
+    ('h_ppo_sym_kl_loss', 8),
+    ('h_ppo_symloss_eps', 9),  # eps before plain symloss in check order
+    ('theta_0.25', 10),
+    ('theta_0.5', 11),
+    ('theta_0.75', 12),
+    ('h_ppo_symloss', 13),  # plain symloss last in checks (after theta/eps)
 ]
+
+SMOOTH_WINDOW = 25
+
+
+def _running_average(values, window=SMOOTH_WINDOW):
+    """Simple running-average smoothing with same-length output."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return arr
+    window = int(max(1, min(window, arr.size)))
+    if window == 1:
+        return arr
+    kernel = np.ones(window, dtype=float) / float(window)
+    # Use edge padding to avoid artificial edge drops from zero padding.
+    left = window // 2
+    right = window - 1 - left
+    padded = np.pad(arr, (left, right), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
 
 def get_model_order_key(full_name):
     """Return a sort key based on desired model ordering."""
@@ -37,22 +67,43 @@ def get_model_order_key(full_name):
     # Check for ppo_reward_machine or ppo_rm (second)
     if 'ppo_reward_machine' in name_lower or 'ppo_rm' in name_lower:
         return 1
-    
-    # Check for theta variants first (most specific)
-    if 'theta_0.25' in name_lower:
-        return 5
-    if 'theta_0.5' in name_lower:
-        return 6  
-    if 'theta_0.75' in name_lower:
-        return 7
-    
-    # Then other h_ppo variants
+
     if 'h_ppo_product' in name_lower:
         return 2
-    if 'h_ppo_symloss_eps' in name_lower:
-        return 4
-    if 'h_ppo_symloss' in name_lower:
+
+    # PSM variants
+    if 'h_ppo_psm' in name_lower:
+        if 'netembed' in name_lower:
+            return 4
         return 3
+
+    # KD-Loss variants
+    if 'h_ppo_kdloss_full' in name_lower:
+        return 6
+    if 'h_ppo_kdloss' in name_lower or 'kdloss' in name_lower:
+        return 5
+
+    # Sym-KD / Sym-KL
+    if 'h_ppo_sym_kl_loss' in name_lower:
+        return 8
+    if 'h_ppo_sym_kd' in name_lower:
+        return 7
+
+    # SymLoss variants (check specific variants before generic)
+    if 'h_ppo_symloss_eps' in name_lower:
+        return 9
+    
+    # Check for theta variants (specific)
+    if 'theta_0.25' in name_lower:
+        return 10
+    if 'theta_0.5' in name_lower:
+        return 11
+    if 'theta_0.75' in name_lower:
+        return 12
+
+    # Generic SymLoss last
+    if 'h_ppo_symloss' in name_lower:
+        return 13
     
     return 100  # Unknown models go last
 
@@ -68,7 +119,25 @@ def get_short_label(full_name):
     if 'theta_0.75' in name_lower:
         return 'H-PPO\nSymLoss θ=0.75'
     
-    # Then other variants
+    # PSM variants
+    if 'h_ppo_psm' in name_lower:
+        if 'netembed' in name_lower:
+            return 'H-PPO\nPSM NetEmbed'
+        return 'H-PPO\nPSM'
+
+    # KD-Loss variants
+    if 'h_ppo_kdloss_full' in name_lower:
+        return 'H-PPO\nKD Loss Full'
+    if 'h_ppo_kdloss' in name_lower or 'kdloss' in name_lower:
+        return 'H-PPO\nKD Loss'
+
+    # Sym-KD / Sym-KL
+    if 'h_ppo_sym_kl_loss' in name_lower:
+        return 'H-PPO\nSym KL Loss'
+    if 'h_ppo_sym_kd' in name_lower:
+        return 'H-PPO\nSym KD'
+
+    # SymLoss variants
     if 'h_ppo_symloss_eps' in name_lower:
         return 'H-PPO\nSymLoss ϵ'
     if 'h_ppo_symloss' in name_lower:
@@ -84,18 +153,32 @@ def get_short_label(full_name):
 
 def get_color(label):
     """Get color based on model type."""
+    label_lower = label.lower()
+
     # Check in order - more specific patterns first
-    if 'h_ppo_symloss_theta' in label.lower() or 'theta_0.' in label.lower():
+    if 'h_ppo_symloss_theta' in label_lower or 'theta_0.' in label_lower:
         return MODEL_COLORS['h_ppo_symloss_theta']
-    elif 'h_ppo_symloss_eps' in label.lower():
+    elif 'h_ppo_symloss_eps' in label_lower:
         return MODEL_COLORS['h_ppo_symloss_eps']
-    elif 'h_ppo_symloss' in label.lower():
+    elif 'h_ppo_symloss' in label_lower:
         return MODEL_COLORS['h_ppo_symloss']
-    elif 'h_ppo_product' in label.lower():
+    elif 'h_ppo_sym_kl_loss' in label_lower or 'sym kl' in label_lower:
+        return MODEL_COLORS['h_ppo_sym_kl_loss']
+    elif 'h_ppo_sym_kd' in label_lower or 'sym kd' in label_lower:
+        return MODEL_COLORS['h_ppo_sym_kd']
+    elif 'h_ppo_psm_netembed' in label_lower or 'netembed' in label_lower:
+        return MODEL_COLORS['h_ppo_psm_netembed']
+    elif 'h_ppo_psm' in label_lower:
+        return MODEL_COLORS['h_ppo_psm']
+    elif 'h_ppo_kdloss_full' in label_lower:
+        return MODEL_COLORS['h_ppo_kdloss_full']
+    elif 'h_ppo_kdloss' in label_lower or 'kdloss' in label_lower:
+        return MODEL_COLORS['h_ppo_kdloss']
+    elif 'h_ppo_product' in label_lower:
         return MODEL_COLORS['h_ppo_product']
-    elif 'ppo_reward_machine' in label.lower() or 'ppo_rm' in label.lower() or 'reward machine' in label.lower():
+    elif 'ppo_reward_machine' in label_lower or 'ppo_rm' in label_lower or 'reward machine' in label_lower:
         return MODEL_COLORS['ppo_reward_machine']
-    elif 'ppo' in label.lower() and 'h_ppo' not in label.lower():
+    elif 'ppo' in label_lower and 'h_ppo' not in label_lower:
         return MODEL_COLORS['ppo']
     return '#7F8C8D'  # Default gray
 
@@ -112,7 +195,25 @@ def get_model_type(full_model_name):
     if 'theta_0.75' in name_lower:
         return 'h_ppo_symloss_theta_0.75'
     
-    # Then other variants
+    # PSM variants
+    if 'h_ppo_psm' in name_lower:
+        if 'netembed' in name_lower:
+            return 'h_ppo_psm_netembed'
+        return 'h_ppo_psm'
+
+    # KD-Loss variants
+    if 'h_ppo_kdloss_full' in name_lower:
+        return 'h_ppo_kdloss_full'
+    if 'h_ppo_kdloss' in name_lower or 'kdloss' in name_lower:
+        return 'h_ppo_kdloss'
+
+    # Sym-KD / Sym-KL
+    if 'h_ppo_sym_kl_loss' in name_lower:
+        return 'h_ppo_sym_kl_loss'
+    if 'h_ppo_sym_kd' in name_lower:
+        return 'h_ppo_sym_kd'
+
+    # SymLoss variants
     if 'h_ppo_symloss_eps' in name_lower:
         return 'h_ppo_symloss_eps'
     if 'h_ppo_symloss' in name_lower:
@@ -185,7 +286,9 @@ def generate_boxplots():
                     continue
                 
                 # Sort by model order
-                csv_files.sort(key=lambda x: get_model_order_key(x.replace(".csv", "")))
+                csv_files.sort(
+                    key=lambda x: (get_model_order_key(x.replace(".csv", "")), x.lower())
+                )
                 
                 for csv_file in csv_files:
                     file_path = os.path.join(eval_type_path, csv_file)
@@ -242,6 +345,7 @@ def generate_boxplots():
             
             # Generate per-model boxplots (same model across different eval types)
             _generate_per_model_boxplots(env_folder_path, env_folder_name, per_model_data)
+
     
     # Generate success rate tables
     _generate_success_rate_tables(base_dir, global_success_data)
@@ -283,7 +387,7 @@ def _generate_success_rate_tables(base_dir, global_success_data):
                 typed_success_data[eval_type][map_name][model_type] = success_rate
     
     # Sort model types by order key
-    sorted_model_types = sorted(all_model_types, key=get_model_order_key)
+    sorted_model_types = sorted(all_model_types, key=lambda x: (get_model_order_key(x), x.lower()))
     sorted_maps = sorted(all_maps)
     
     # Generate table for each eval type
@@ -438,7 +542,6 @@ def _create_table_image(df, title, save_path, eval_type_col=None):
     
     # Determine row colors based on eval type column if provided
     if eval_type_col and eval_type_col in df.columns:
-        eval_col_idx = df.columns.get_loc(eval_type_col)
         for i in range(len(df)):
             eval_type_value = df.iloc[i][eval_type_col]
             row_color = eval_type_colors.get(eval_type_value, default_colors[i % 2])
@@ -629,7 +732,7 @@ def _generate_single_boxplot(folder_path, folder_name, csv_files):
     labels = []
     full_names = []
     # Sort by model order
-    csv_files.sort(key=lambda x: get_model_order_key(x.replace(".csv", "")))
+    csv_files.sort(key=lambda x: (get_model_order_key(x.replace(".csv", "")), x.lower()))
     
     for csv_file in csv_files:
         file_path = os.path.join(folder_path, csv_file)
