@@ -132,7 +132,7 @@ def evaluate(
                     # Fallback: sample from actions not executed in this window.
                     num_actions = envs.single_action_space.n
                     excluded = set(action_block[-rolling_window_size:])
-                    special_excludes = {4} # Exclude None in WaterWorld
+                    special_excludes = {4} # Exclude None in WaterWorld, in OfficeWorld no special excludes.
                     candidate_actions = [a for a in range(num_actions) if a not in excluded and a not in special_excludes]
                     if not candidate_actions:
                         candidate_actions = [a for a in range(num_actions) if a not in special_excludes]
