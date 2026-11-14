@@ -21,7 +21,7 @@ class Args:
     cuda: bool = False
     """if toggled, cuda will be enabled by default"""
     
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
 
     wandb_project_name: str = WANDB_PROJECT_NAME
@@ -119,8 +119,6 @@ class Args:
     exploration_fraction: float = 0.4
     """fraction of total iterations over which epsilon decays linearly"""
 
-    theta: float = 1.0
-    """coefficient for symbolic loss term"""
 
     psm_aux_coef: float = 1.0
     """coefficient for the PSM/CME auxiliary loss"""
@@ -133,9 +131,6 @@ class Args:
 
     psm_dp_eps: float = 1e-7
     """stopping threshold for the rollout-level PSM fixed-point solver (paper J.1 uses 1e-7)"""
-
-    p_2key: float = 0.0
-    """probability of using n_keys=2 at each episode reset (0.0 = always 1 key, pure training)"""
 
     # to be filled in runtime
     batch_size: int = 0

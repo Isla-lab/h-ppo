@@ -152,17 +152,18 @@ def evaluate(
         episode_values.append(value_val)
         episode_probs.append(probs_val)
 
-        per_step_metrics.append(
-            {
-                "Episode": len(episodic_returns) + 1,
-                "Step": current_episode_step,
-                "Action": float(chosen_action),
-                "LogProb": logprob_val,
-                "Entropy": entropy_val,
-                "Value": value_val,
-                "Probs": probs_val,
-            }
-        )
+        if return_episode_metrics:  # only kept when the caller asks for them (saves ~0.7 kB per step)
+            per_step_metrics.append(
+                {
+                    "Episode": len(episodic_returns) + 1,
+                    "Step": current_episode_step,
+                    "Action": float(chosen_action),
+                    "LogProb": logprob_val,
+                    "Entropy": entropy_val,
+                    "Value": value_val,
+                    "Probs": probs_val,
+                }
+            )
         total_eval_steps += 1
         if track:
             writer.add_scalar("eval_step/action", float(chosen_action), total_eval_steps)

@@ -60,6 +60,12 @@ class Args:
     if delta > threshold the network is improving enough, so we let it cook.
     0.0 = old behaviour (any positive increase skips rules); increase to require a larger improvement"""
 
+    log_rule_stats: bool = False
+    """if True, also logs for every episode the number of steps, the steps where the rules suggest at least one
+    action (RuleSteps) and the steps where the executed action is a suggested one (RuleMatches), and writes
+    aggregate_evals_rulestats/<env>/<eval_type>/<model>.csv (one row per episode) instead of the Return-only CSV.
+    The evaluation itself is unchanged. Activation rate = RuleMatches / RuleSteps."""
+
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 

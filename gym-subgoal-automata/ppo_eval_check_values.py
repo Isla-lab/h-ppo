@@ -97,7 +97,7 @@ def evaluate(
     total_eval_steps = 0
     pbar = tqdm(total=eval_episodes)
     tqdm.write(f"Model path: {model_path}")
-    tqdm.write(f"Evaluating {env_id} with {eval_episodes} episodes (check_values_OLD)")
+    tqdm.write(f"Evaluating {env_id} with {eval_episodes} episodes (check_values)")
     tqdm.write(f"  rolling_window_size={rolling_window_size}, value_skip_threshold={value_skip_threshold}")
 
     while len(episodic_returns) < eval_episodes:

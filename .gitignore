@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments and local settings
+.venv/
+venv/
+.env
+
+# Logs and results written by training and evaluation
+wandb/
+runs/
+videos/
+aggregate_evals*/
+
+# Trained models (available from the authors on request)
+models/

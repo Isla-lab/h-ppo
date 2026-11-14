@@ -21,7 +21,7 @@ class Args:
     cuda: bool = False
     """if toggled, cuda will be enabled by default"""
     
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
 
     wandb_project_name: str = WANDB_PROJECT_NAME
@@ -116,8 +116,6 @@ class Args:
     exploration_fraction: float = 0.4
     """fraction of total iterations over which epsilon decays linearly"""
 
-    theta: float = 0.75
-    """coefficient for symbolic loss term"""
 
     psm_aux_coef: float = 1.0
     """coefficient for the PSM/CME auxiliary loss"""

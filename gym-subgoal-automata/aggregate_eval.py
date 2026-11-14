@@ -11,48 +11,86 @@ import ppo_eval
 import h_ppo_eval
 import ppo_eval_random_rules
 import ppo_eval_check_values
-import ppo_eval_check_values_old
 from ppo import make_env, Agent as PPOAgent
 from ppo_reward_machine import Agent as PPORMAgent
-from h_ppo_PSM import Agent as HPPOPSMAgent
+from h_ppo_psm_sym import Agent as HPPOPSMSymAgent
 from h_ppo_product import Agent as HPPOProductAgent
-from h_ppo_PSM_netembed import Agent as HPPOPSMNetEmbedAgent
-from h_ppo_kdloss import Agent as HPPOKDLossAgent
-from h_ppo_kdloss_full import Agent as HPPOKDLossFullAgent
-from h_ppo_sym_kd import Agent as HPPOSymKDAgent
-from h_ppo_sym_ce_loss import Agent as HPPOSymCELossAgent
-from h_ppo_sym_kl_loss import Agent as HPPOSymKLLossAgent
 from h_ppo_symloss import Agent as HPPOSymLossAgent
 from h_ppo_symloss_eps import Agent as HPPOSymLossEpsAgent
-from h_ppo_symloss_theta import Agent as HPPOSymLossThetaAgent
+import gym
+
+
+class RuleStatsMonitor(gym.Wrapper):
+    """Counts, for every episode, the steps where the rules suggest at least one action
+    and the steps where the executed action is one of the suggested ones.
+
+    The suggestions are queried with guide_agent() on the state *before* the step,
+    which is deterministic and does not consume random numbers, so the evaluation
+    itself is unchanged.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.episodes = []  # one dict per completed episode
+        self._reset_counters()
+
+    def _reset_counters(self):
+        self._steps = 0
+        self._rule_steps = 0
+        self._rule_matches = 0
+
+    def reset(self, **kwargs):
+        self._reset_counters()
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        suggested = [a for a in self.env.unwrapped.guide_agent() if a is not None]
+        executed = int(np.asarray(action).item())
+        self._steps += 1
+        if suggested:
+            self._rule_steps += 1
+            self._rule_matches += int(executed in suggested)
+        obs, reward, done, info = self.env.step(action)
+        if done:
+            self.episodes.append({"Steps": self._steps, "RuleSteps": self._rule_steps,
+                                  "RuleMatches": self._rule_matches})
+        return obs, reward, done, info
+
+
+def make_monitored_env_factory(created_envs):
+    """Same signature as ppo.make_env; wraps the env with RuleStatsMonitor and records it."""
+    def _make_env(env_id, seed, idx, capture_video, run_name):
+        thunk = make_env(env_id, seed, idx, capture_video, run_name)
+
+        def _thunk():
+            env = RuleStatsMonitor(thunk())
+            created_envs.append(env)
+            return env
+        return _thunk
+    return _make_env
+
+
+def get_layout_seeds(args, master_seed, run_index):
+    """Environment seeds (map layouts) evaluated for one checkpoint."""
+    if args.layout_mode == "train":
+        return [master_seed + k for k in range(args.num_layouts)]
+    if args.layout_mode == "unseen":
+        return [args.unseen_seed_offset + 1000 * run_index + k for k in range(args.num_layouts)]
+    raise ValueError(f"Unknown layout_mode: {args.layout_mode}, must be 'train' or 'unseen'.")
 
 def get_agent_class(model_name: str):
     """Return the appropriate Agent class based on model name."""
     m_lower = model_name.lower()
     if m_lower == "ppo_reward_machine" or m_lower == "ppo_rm":
         return PPORMAgent
-    elif m_lower == "h_ppo_psm":
-        return HPPOPSMAgent
+    elif m_lower == "h_ppo_psm_sym":
+        return HPPOPSMSymAgent
     elif m_lower == "h_ppo_product":
         return HPPOProductAgent
-    elif m_lower == "h_ppo_psm_netembed":
-        return HPPOPSMNetEmbedAgent
-    elif m_lower == "h_ppo_kdloss":
-        return HPPOKDLossAgent
-    elif m_lower == "h_ppo_kdloss_full":
-        return HPPOKDLossFullAgent
-    elif m_lower == "h_ppo_sym_kd":
-        return HPPOSymKDAgent
-    elif m_lower == "h_ppo_sym_ce_loss":
-        return HPPOSymCELossAgent
-    elif m_lower == "h_ppo_sym_kl_loss":
-        return HPPOSymKLLossAgent
     elif m_lower == "h_ppo_symloss":
         return HPPOSymLossAgent
     elif m_lower == "h_ppo_symloss_eps":
         return HPPOSymLossEpsAgent
-    elif m_lower == "h_ppo_symloss_theta":
-        return HPPOSymLossThetaAgent
     else:
         return PPOAgent
 
@@ -127,9 +165,6 @@ def main():
     if "random_rules" in args.eval_type:
         eval_func = ppo_eval_random_rules.evaluate
         eval_type_subfolder = "random_rules"
-    elif args.eval_type == "check_values_OLD":
-        eval_func = ppo_eval_check_values_old.evaluate
-        eval_type_subfolder = "check_values_OLD"
     elif "check_values" in args.eval_type:
         eval_func = ppo_eval_check_values.evaluate
         eval_type_subfolder = "check_values"
@@ -155,8 +190,16 @@ def main():
     collect_episode_metrics = low_eval and args.model_name == "ppo" and eval_func in {
         ppo_eval.evaluate,
         ppo_eval_check_values.evaluate,
-        ppo_eval_check_values_old.evaluate,
     }
+
+    # Multi-layout evaluation and/or per-episode rule statistics (activation rate).
+    extended = args.num_layouts > 1 or args.layout_mode != "train" or args.log_rule_stats
+    extended_rows = []
+    if extended:
+        assert args.eval_episodes % args.num_layouts == 0, "eval_episodes must be divisible by num_layouts"
+        collect_episode_metrics = False
+        print(f"Layouts per seed: {args.num_layouts} ({args.layout_mode}), "
+              f"{args.eval_episodes // args.num_layouts} episodes each; rule stats: {args.log_rule_stats}")
 
     for i, s in enumerate(master_seeds):
         print(f"\n--- Run {i+1}/{len(master_seeds)} with Master Seed {s} ---")
@@ -180,11 +223,37 @@ def main():
         if eval_func == h_ppo_eval.evaluate:
             eval_kwargs["epsilon"] = args.epsilon
 
-        if eval_func in {ppo_eval_check_values.evaluate, ppo_eval_check_values_old.evaluate}:
+        if eval_func == ppo_eval_check_values.evaluate:
             eval_kwargs["rolling_window_size"] = args.rolling_window_size
             eval_kwargs["value_skip_threshold"] = args.value_skip_threshold
 
-        if collect_episode_metrics:
+        if extended:
+            # One evaluate() call per layout: the layout is fixed by the environment seed,
+            # which ppo.make_env passes to the environment as "environment_seed".
+            returns = []
+            for layout_seed in get_layout_seeds(args, s, i):
+                created_envs = []
+                layout_kwargs = dict(
+                    eval_kwargs,
+                    make_env=make_monitored_env_factory(created_envs),
+                    eval_episodes=args.eval_episodes // args.num_layouts,
+                    seed=layout_seed,
+                    run_name=f"{args.env_id}_seed_{s}_layout_{layout_seed}",
+                )
+                layout_returns = eval_func(**layout_kwargs)
+                episodes = created_envs[0].episodes[: len(layout_returns)]
+                assert len(episodes) == len(layout_returns), (len(episodes), len(layout_returns))
+                for ep_idx, (ret, ep) in enumerate(zip(layout_returns, episodes), start=1):
+                    extended_rows.append({
+                        "MasterSeed": s,
+                        "LayoutSeed": layout_seed,
+                        "Episode": ep_idx,
+                        "Return": float(ret.item() if hasattr(ret, "item") else ret),
+                        **ep,
+                    })
+                returns.extend(layout_returns)
+            metrics = None
+        elif collect_episode_metrics:
             returns, metrics = eval_func(**eval_kwargs, return_episode_metrics=True)
         else:
             returns = eval_func(**eval_kwargs)
@@ -255,6 +324,10 @@ def main():
     low_eval = args.eval_episodes < 1000
 
     base_dir = "aggregate_evals_logs" if low_eval else "aggregate_evals"
+    if extended:
+        base_dir = "aggregate_evals_multilayout"
+    if args.output_root:
+        base_dir = args.output_root
     target_dir = os.path.join(base_dir, args.env_id.replace(":", "_"), eval_type_subfolder)
     os.makedirs(target_dir, exist_ok=True)
     # It should use model_dir_name = ppo_RM_DeliverCoffee_v1 or similar.
@@ -263,16 +336,25 @@ def main():
 
     model_file_stem = _normalize_eval_episode_suffix(model_dir_name, args.eval_episodes)
     # Append check_values with its config params so different window/threshold runs are distinct.
-    if eval_type_subfolder in ["check_values", "check_values_OLD"]:
+    if eval_type_subfolder == "check_values":
         cv_suffix = f"_check_values_w{args.rolling_window_size}_t{args.value_skip_threshold}"
         if not model_file_stem.endswith(cv_suffix):
             model_file_stem = f"{model_file_stem}{cv_suffix}"
             
+    if extended:
+        model_file_stem = f"{model_file_stem}_{args.layout_mode}_{args.num_layouts}layouts"
     model_file_stem = _append_eval_code_suffix(model_file_stem, args.eval_code)
     csv_path = os.path.join(target_dir, f"{model_file_stem}.csv")
 
     print(f"Saving returns to {csv_path}")
-    if low_eval:
+    if extended:
+        # One row per episode, with the layout and the rule statistics.
+        fieldnames = ["MasterSeed", "LayoutSeed", "Episode", "Return", "Steps", "RuleSteps", "RuleMatches"]
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(extended_rows)
+    elif low_eval:
         # Detailed per-step schema for low-eval runs (< 1000 episodes).
         fieldnames = ["GlobalStep", "MasterSeed", "Episode", "EpisodeStep",
                       "Return", "Action", "LogProb", "Entropy", "Value",

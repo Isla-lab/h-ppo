@@ -93,7 +93,9 @@ def evaluate(
     tqdm.write(f"Evaluating {env_id} with {n_keys} keys, {eval_episodes} episodes")
 
     while len(episodic_returns) < eval_episodes:
-        actions, logprobs, entropies, values, probs = agent.get_action_and_value(torch.Tensor(obs).to(device))
+        obs_t = torch.Tensor(obs).to(device)
+        actions, logprobs, entropies, values = agent.get_action_and_value(obs_t)
+        probs = torch.softmax(agent.actor(obs_t), dim=-1)
         action_val = float(actions.item())
         logprob_val = float(logprobs.item())
         entropy_val = float(entropies.item())
@@ -106,17 +108,18 @@ def evaluate(
         episode_values.append(value_val)
         episode_probs.append(probs_val)
 
-        per_step_metrics.append(
-            {
-                "Episode": len(episodic_returns) + 1,
-                "Step": len(episode_actions),
-                "Action": action_val,
-                "LogProb": logprob_val,
-                "Entropy": entropy_val,
-                "Value": value_val,
-                "Probs": probs_val
-            }
-        )
+        if return_episode_metrics:  # only kept when the caller asks for them (saves ~0.7 kB per step)
+            per_step_metrics.append(
+                {
+                    "Episode": len(episodic_returns) + 1,
+                    "Step": len(episode_actions),
+                    "Action": action_val,
+                    "LogProb": logprob_val,
+                    "Entropy": entropy_val,
+                    "Value": value_val,
+                    "Probs": probs_val
+                }
+            )
         total_eval_steps += 1
         if track:
             writer.add_scalar("eval_step/action", action_val, total_eval_steps)

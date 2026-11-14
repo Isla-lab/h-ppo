@@ -16,17 +16,14 @@ import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-from doorkey_helpers import apply_rules_batch, get_observables, MixedKeyEnvWrapper
+from doorkey_helpers import apply_rules_batch, get_observables
 
 
-def make_env(env_id, n_keys, idx, capture_video, run_name, random_color=True, p_2key=0.0):
+def make_env(env_id, n_keys, idx, capture_video, run_name, random_color=True):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, random_color=random_color, render_mode="rgb_array", n_keys=n_keys)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        elif p_2key > 0.0:
-            # Mixed training: randomly uses n_keys=2 with probability p_2key at each reset
-            env = MixedKeyEnvWrapper(env_id, p_2key=p_2key, random_color=random_color)
         else:
             env = gym.make(env_id, n_keys=n_keys, random_color=random_color)
             env = gym.wrappers.FlattenObservation(
@@ -128,7 +125,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.n_keys, i, args.capture_video, run_name, args.random_color, args.p_2key) for i in range(args.num_envs)],
+        [make_env(args.env_id, args.n_keys, i, args.capture_video, run_name, args.random_color) for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
     agent = Agent(envs).to(device)

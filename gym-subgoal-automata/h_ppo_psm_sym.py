@@ -54,6 +54,74 @@ def total_variation_distance_matrix(p1, p2):
     return 0.5 * torch.abs(p1[:, None, :] - p2[None, :, :]).sum(dim=-1)
 
 
+def build_transition_terminals(dones):
+    """Marks whether the transition out of each rollout step is terminal.
+
+    In CleanRL-style storage, `dones[t]` is the done flag *before* stepping from
+    `obs[t]`, so transition-terminal flags must be shifted by one step.
+    """
+    transition_terminals = torch.zeros_like(dones, dtype=torch.bool)
+    if dones.shape[0] > 1:
+        transition_terminals[:-1] = dones[1:].bool()
+    transition_terminals[-1] = True
+    return transition_terminals
+
+
+def compute_policy_similarity_metric_fixed_point(
+    policy_distance_matrix,
+    has_successor_x,
+    has_successor_y,
+    gamma,
+    dp_eps,
+):
+    """Solver for the deterministic D.2 recursion, with terminal-transition masking.
+
+    The recursion only looks one step ahead, d(i, j) = D(i, j) + gamma * d(i+1, j+1),
+    so its fixed point is reached exactly by one backward pass over the rollout
+    steps. This gives the same result as the `while True` fixed-point iteration of
+    jumping_task, without its ~num_x full-matrix passes; dp_eps is no longer needed.
+    """
+    num_x, num_y = policy_distance_matrix.shape
+    if num_x == 0 or num_y == 0:
+        return policy_distance_matrix
+
+    # Paper D.2 convention: DIST between terminal states is zero.
+    terminal_pair_mask = (~has_successor_x)[:, None] & (~has_successor_y)[None, :]
+    effective_policy_distance = torch.where(
+        terminal_pair_mask,
+        torch.zeros_like(policy_distance_matrix),
+        policy_distance_matrix,
+    )
+
+    current_metric = torch.zeros_like(policy_distance_matrix)
+    next_x = (torch.arange(num_x, device=policy_distance_matrix.device) + 1).clamp(max=num_x - 1)
+    next_y = (torch.arange(num_y, device=policy_distance_matrix.device) + 1).clamp(max=num_y - 1)
+    future_mask = has_successor_x[:, None] & has_successor_y[None, :]
+    zero_future = torch.zeros_like(policy_distance_matrix)
+
+    for i in reversed(range(num_x)):
+        shifted_future = current_metric[next_x[i]][next_y]
+        current_metric[i] = effective_policy_distance[i] + gamma * torch.where(
+            future_mask[i],
+            shifted_future,
+            zero_future[i],
+        )
+    return current_metric
+
+
+class LazyPairCache(dict):
+    """Dict of env pairs whose values are computed the first time they are requested."""
+
+    def __init__(self, compute_fn):
+        super().__init__()
+        self.compute_fn = compute_fn
+
+    def __missing__(self, key):
+        value = self.compute_fn(key)
+        self[key] = value
+        return value
+
+
 def compute_psm_contrastive_loss(similarity_matrix, gamma_matrix, temperature):
     n, m = similarity_matrix.shape
     if n == 0 or m == 0:
@@ -92,14 +160,16 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor = nn.Sequential(
+        # Same layers and initialisation as the PPO actor, split so that the PSM
+        # embedding is computed from the hidden representation used by the policy.
+        self.actor_trunk = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
         )
-        self.grounded_projection = nn.Sequential(
+        self.actor_head = layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01)
+        self.projection = nn.Sequential(
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64), std=1.0),
@@ -165,7 +235,7 @@ class Agent(nn.Module):
         return self.critic(x)
 
     def get_policy_probs(self, x):
-        return torch.softmax(self.actor(x), dim=-1)
+        return torch.softmax(self.actor_head(self.actor_trunk(x)), dim=-1)
 
     def _decode_office_state_id(self, state_id, width, height):
         possible_values = [width, height, 2, 2, 4]
@@ -333,8 +403,13 @@ class Agent(nn.Module):
 
         return torch.zeros((x.shape[0], self.grounded_dim), device=x.device, dtype=x.dtype)
 
-    def get_grounded_embedding(self, x, env_indices):
-        z = self.grounded_projection(self.get_grounded_vectors(x, env_indices))
+    def get_embedding(self, x):
+        """PSM embedding: normalised projection of the policy's hidden representation.
+
+        Gradients of the PSM loss flow into actor_trunk, i.e. into the policy itself
+        (Agarwal et al., 2021, policy similarity embeddings).
+        """
+        z = self.projection(self.actor_trunk(x))
         return z / (z.norm(dim=-1, keepdim=True) + 1e-8)
 
     def get_symbolic_probs(self, x, envs):
@@ -345,8 +420,12 @@ class Agent(nn.Module):
                     sym_probs[i, suggested_action] = self.conf_level
         return sym_probs / sym_probs.sum(dim=-1, keepdim=True)
 
+    def actor(self, x):
+        """Policy logits, as the `actor` module of the other agents (used by the evaluation scripts)."""
+        return self.actor_head(self.actor_trunk(x))
+
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        logits = self.actor_head(self.actor_trunk(x))
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
@@ -371,7 +450,7 @@ if __name__ == "__main__":
             name=run_name,
             monitor_gym=True,
             save_code=True,
-            group=f"h_ppo_PSM_{args.group_name}",
+            group=f"h_ppo_psm_sym_{args.group_name}",
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -382,6 +461,8 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    # Separate generator for the PSM env pairs, so that it does not shift the other random streams.
+    psm_pair_rng = np.random.default_rng(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
@@ -478,20 +559,34 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
 
         # Precompute rollout-level pairwise couplings once per iteration.
-        pair_gamma = {}
-        pair_metric = {}
-        for src_env in range(args.num_envs):
-            sym_src = symbolic_probs[:, src_env, :]
-            for tgt_env in range(args.num_envs):
-                if src_env == tgt_env:
-                    continue
-                neu_tgt = neural_probs[:, tgt_env, :]
-                dist = total_variation_distance_matrix(sym_src, neu_tgt)
-                gamma_mat = torch.exp(-dist / max(args.psm_beta, 1e-8))
-                pair_gamma[(src_env, tgt_env)] = gamma_mat
-                pair_metric[(src_env, tgt_env)] = dist.mean()
+        # Symbolic policy on both sides: two states are close if the rules prescribe
+        # similar behaviour in them and along the following steps (PSM recursion).
+        # Each minibatch uses a single pair, so a pair is computed the first time it is
+        # used and cached for the rest of the rollout.
+        with torch.no_grad():
+            transition_terminals = build_transition_terminals(dones)
+            has_successor = torch.arange(args.num_steps, device=device) < (args.num_steps - 1)
 
-        pair_cycle = 0
+        def compute_pair_metric(pair):
+            src_env, tgt_env = pair
+            with torch.no_grad():
+                sym_src = symbolic_probs[:, src_env, :]
+                active_src = has_successor & (~transition_terminals[:, src_env])
+                sym_tgt = symbolic_probs[:, tgt_env, :]
+                active_tgt = has_successor & (~transition_terminals[:, tgt_env])
+                dist = total_variation_distance_matrix(sym_src, sym_tgt)
+                return compute_policy_similarity_metric_fixed_point(
+                    policy_distance_matrix=dist,
+                    has_successor_x=active_src,
+                    has_successor_y=active_tgt,
+                    gamma=args.gamma,
+                    dp_eps=args.psm_dp_eps,
+                )
+
+        pair_metric_matrix = LazyPairCache(compute_pair_metric)
+        pair_gamma = LazyPairCache(lambda pair: torch.exp(-pair_metric_matrix[pair] / max(args.psm_beta, 1e-8)))
+        pair_metric = LazyPairCache(lambda pair: pair_metric_matrix[pair].mean())
+
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         psm_losses = []
@@ -529,19 +624,15 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                # Deterministic pair cycling using minibatch membership.
-                mb_envs = torch.remainder(torch.as_tensor(mb_inds, dtype=torch.long), args.num_envs)
-                tgt_candidates = torch.unique(mb_envs).tolist()
-                if len(tgt_candidates) > 0 and args.num_envs > 1:
-                    tgt_env = tgt_candidates[pair_cycle % len(tgt_candidates)]
-                    src_candidates = [e for e in range(args.num_envs) if e != tgt_env]
-                    src_env = src_candidates[(pair_cycle // max(1, len(tgt_candidates))) % len(src_candidates)]
+                # One ordered pair of distinct envs per minibatch, uniformly at random.
+                if args.num_envs > 1:
+                    src_env, tgt_env = psm_pair_rng.choice(args.num_envs, size=2, replace=False).tolist()
                     pair = (src_env, tgt_env)
 
                     src_idx = torch.arange(args.num_steps, device=device) * args.num_envs + src_env
                     tgt_idx = torch.arange(args.num_steps, device=device) * args.num_envs + tgt_env
-                    src_emb = agent.get_grounded_embedding(b_obs[src_idx], src_env)
-                    tgt_emb = agent.get_grounded_embedding(b_obs[tgt_idx], tgt_env)
+                    src_emb = agent.get_embedding(b_obs[src_idx])
+                    tgt_emb = agent.get_embedding(b_obs[tgt_idx])
                     similarity = src_emb @ tgt_emb.T
 
                     psm_loss = compute_psm_contrastive_loss(
@@ -550,7 +641,6 @@ if __name__ == "__main__":
                         temperature=args.psm_temperature,
                     )
                     psm_metric = pair_metric[pair]
-                    pair_cycle += 1
                 else:
                     psm_loss = b_obs.new_zeros(())
                     psm_metric = b_obs.new_zeros(())
@@ -586,8 +676,8 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     if args.save_model:
-        os.makedirs(f"models/h_ppo_PSM_{args.task}{args.run_code}", exist_ok=True)
-        model_path = f"models/h_ppo_PSM_{args.task}{args.run_code}/h_ppo_PSM_seed={args.seed}.pt"
+        os.makedirs(f"models/h_ppo_psm_sym_{args.task}{args.run_code}", exist_ok=True)
+        model_path = f"models/h_ppo_psm_sym_{args.task}{args.run_code}/h_ppo_psm_sym_seed={args.seed}.pt"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
 

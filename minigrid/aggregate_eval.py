@@ -12,19 +12,73 @@ import h_ppo_eval
 import ppo_eval_random_rules
 import ppo_eval_check_values
 from ppo import make_env, Agent as PPOAgent
-from h_ppo_PSM import Agent as HPPOPSMAgent
+import gymnasium as gym
+from doorkey_helpers import apply_rules_batch, get_observables
+from h_ppo_psm_sym import Agent as HPPOPSMSymAgent
 from h_ppo_product import Agent as HPPOProductAgent
-from h_ppo_PSM_netembed import Agent as HPPOPSMnetembedAgent
+
+class RuleStatsMonitor(gym.Wrapper):
+    """Counts, for every episode, the steps where the rules suggest at least one action
+    and the steps where the executed action is one of the suggested ones.
+
+    The suggestions are computed with apply_rules_batch() on the observation the policy acted on,
+    exactly as in h_ppo_eval / ppo_eval_random_rules. This is deterministic and does not consume
+    random numbers, so the evaluation itself is unchanged.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.episodes = []  # one dict per completed episode
+        self._last_obs = None
+        self._reset_counters()
+
+    def _reset_counters(self):
+        self._steps = 0
+        self._rule_steps = 0
+        self._rule_matches = 0
+
+    def reset(self, **kwargs):
+        self._reset_counters()
+        obs, info = self.env.reset(**kwargs)
+        self._last_obs = obs
+        return obs, info
+
+    def step(self, action):
+        batch = np.asarray(self._last_obs)[None, :]
+        suggested = [a for a in apply_rules_batch(get_observables(batch[:, 4:]))[0] if a is not None]
+        executed = int(np.asarray(action).item())
+        self._steps += 1
+        if suggested:
+            self._rule_steps += 1
+            self._rule_matches += int(executed in suggested)
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._last_obs = obs
+        if terminated or truncated:
+            self.episodes.append({"Steps": self._steps, "RuleSteps": self._rule_steps,
+                                  "RuleMatches": self._rule_matches})
+        return obs, reward, terminated, truncated, info
+
+
+def make_monitored_env_factory(created_envs):
+    """Same signature as ppo.make_env; wraps the env with RuleStatsMonitor and records it."""
+    def _make_env(env_id, n_keys, idx, capture_video, run_name, random_color=True):
+        thunk = make_env(env_id, n_keys, idx, capture_video, run_name, random_color)
+
+        def _thunk():
+            env = RuleStatsMonitor(thunk())
+            created_envs.append(env)
+            return env
+        return _thunk
+    return _make_env
+
 
 def get_agent_class(model_name: str):
     """Return the appropriate Agent class based on model name."""
     model_name = model_name.lower()
-    if model_name == "h_ppo_psm":
-        return HPPOPSMAgent
+    if model_name == "h_ppo_psm_sym":
+        return HPPOPSMSymAgent
     elif model_name == "h_ppo_product":
         return HPPOProductAgent
-    elif model_name == "h_ppo_psm_netembed":
-        return HPPOPSMnetembedAgent
     else:
         return PPOAgent
 
@@ -126,6 +180,12 @@ def main():
         ppo_eval_check_values.evaluate,
     }
 
+    # Per-episode rule statistics (activation rate): same evaluation, extra counters.
+    rule_stats_rows = []
+    if args.log_rule_stats:
+        collect_episode_metrics = False
+        print("Rule statistics: on (RuleSteps / RuleMatches per episode)")
+
     for i, s in enumerate(master_seeds):
         print(f"\n--- Run {i+1}/{len(master_seeds)} with Master Seed {s} ---")
         args.seed = s  # Update seed for each run
@@ -154,12 +214,27 @@ def main():
             eval_kwargs["rolling_window_size"] = args.rolling_window_size
             eval_kwargs["value_skip_threshold"] = args.value_skip_threshold
 
+        created_envs = []
+        if args.log_rule_stats:
+            eval_kwargs["make_env"] = make_monitored_env_factory(created_envs)
+
         if collect_episode_metrics:
             returns, metrics = eval_func(**eval_kwargs, return_episode_metrics=True)
         else:
             returns = eval_func(**eval_kwargs)
             metrics = None
         all_returns.extend(returns)
+
+        if args.log_rule_stats:
+            episodes = created_envs[0].episodes[: len(returns)]
+            assert len(episodes) == len(returns), (len(episodes), len(returns))
+            for ep_idx, (ret, ep) in enumerate(zip(returns, episodes), start=1):
+                rule_stats_rows.append({
+                    "MasterSeed": s,
+                    "Episode": ep_idx,
+                    "Return": float(ret.item() if hasattr(ret, "item") else ret),
+                    **ep,
+                })
 
         if metrics is not None:
             per_step = metrics.get("per_step", [])
@@ -232,7 +307,7 @@ def main():
     os.makedirs(target_dir, exist_ok=True)
 
     # Extract filename from model_path (part between first and second /)
-    # model_path example: models/h_ppo_symloss_theta_8x8_1keys_theta_0.5/h_ppo_...
+    # model_path example: models/h_ppo_symloss_8x8_1keys/h_ppo_symloss_seed=50.pt
     path_parts = args.model_path.split("/")
     if len(path_parts) > 1:
         model_dir_name = path_parts[1]
@@ -248,8 +323,23 @@ def main():
     model_file_stem = _append_eval_code_suffix(model_file_stem, args.eval_code)
     csv_path = os.path.join(target_dir, f"{model_file_stem}.csv")
 
+    if args.log_rule_stats:
+        # Separate folder and schema: the existing Return-only CSVs of aggregate_evals are left untouched.
+        target_dir = os.path.join("aggregate_evals_rulestats", env_sub_dir, eval_type_subfolder)
+        os.makedirs(target_dir, exist_ok=True)
+        csv_path = os.path.join(target_dir, f"{model_file_stem}.csv")
+
     print(f"Saving returns to {csv_path}")
-    if low_eval:
+    if args.log_rule_stats:
+        fieldnames = ["MasterSeed", "Episode", "Return", "Steps", "RuleSteps", "RuleMatches"]
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rule_stats_rows)
+        rs = sum(r["RuleSteps"] for r in rule_stats_rows)
+        rm = sum(r["RuleMatches"] for r in rule_stats_rows)
+        print(f"Activation rate: {100 * rm / max(rs, 1):.2f}% ({rm}/{rs} rule steps)")
+    elif low_eval:
         # Detailed per-step schema for low-eval runs (< 1000 episodes).
         fieldnames = ["GlobalStep", "MasterSeed", "Episode", "EpisodeStep",
                       "Return", "Action", "LogProb", "Entropy", "Value",

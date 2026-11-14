@@ -69,10 +69,12 @@ def compute_policy_similarity_metric_fixed_point(
     gamma,
     dp_eps,
 ):
-    """Fixed-point dynamic-programming solver for deterministic D.2 recursion.
+    """Solver for the deterministic D.2 recursion, with terminal-transition masking.
 
-    This follows the same style used in jumping_task (`while True` fixed-point
-    iteration), while preserving terminal-transition masking for rollout data.
+    The recursion only looks one step ahead, d(i, j) = D(i, j) + gamma * d(i+1, j+1),
+    so its fixed point is reached exactly by one backward pass over the rollout
+    steps. This gives the same result as the `while True` fixed-point iteration of
+    jumping_task, without its ~num_x full-matrix passes; dp_eps is no longer needed.
     """
     num_x, num_y = policy_distance_matrix.shape
     if num_x == 0 or num_y == 0:
@@ -92,25 +94,21 @@ def compute_policy_similarity_metric_fixed_point(
     future_mask = has_successor_x[:, None] & has_successor_y[None, :]
     zero_future = torch.zeros_like(policy_distance_matrix)
 
-    fixed_point_eps = float(dp_eps)
-
-    while True:
-        shifted_future = current_metric[next_x][:, next_y]
-        updated_metric = effective_policy_distance + gamma * torch.where(
-            future_mask,
+    for i in reversed(range(num_x)):
+        shifted_future = current_metric[next_x[i]][next_y]
+        current_metric[i] = effective_policy_distance[i] + gamma * torch.where(
+            future_mask[i],
             shifted_future,
-            zero_future,
+            zero_future[i],
         )
-        if torch.sum(torch.abs(updated_metric - current_metric)).item() < fixed_point_eps:
-            return updated_metric
-        current_metric = updated_metric
+    return current_metric
 
 
 def compute_psm_contrastive_loss(similarity_matrix, gamma_matrix, temperature):
     """Bidirectional PSM contrastive loss (paper Eq. 4, both directions).
 
-    Ported from h_ppo_PSM_v1 but keeps grounded predicate vectors as similarity
-    (no gradient flows into the actor).
+    The similarity matrix is computed from embeddings of the policy network
+    (see Agent.get_embedding), so the gradient of this loss shapes the policy.
 
     similarity_matrix: (N, M) cosine similarity of grounded vectors
     gamma_matrix:      (N, M) soft coupling Γ(x, y) = exp(-d*/β)
@@ -145,6 +143,19 @@ def compute_psm_contrastive_loss(similarity_matrix, gamma_matrix, temperature):
     return loss_1 + loss_2
 
 
+class LazyPairCache(dict):
+    """Dict of env pairs whose values are computed the first time they are requested."""
+
+    def __init__(self, compute_fn):
+        super().__init__()
+        self.compute_fn = compute_fn
+
+    def __missing__(self, key):
+        value = self.compute_fn(key)
+        self[key] = value
+        return value
+
+
 def precompute_symbolic_to_neural_psm_rollout_cache(
     agent,
     b_obs,
@@ -156,46 +167,38 @@ def precompute_symbolic_to_neural_psm_rollout_cache(
     dp_eps,
     beta,
 ):
-    """Pre-computes symbolic->neural D.2 metrics for all ordered env pairs once per rollout."""
+    """Sets up the symbolic D.2 metrics for the ordered env pairs of one rollout.
+
+    Each minibatch uses a single pair, so only update_epochs * num_minibatches of
+    the num_envs * (num_envs - 1) pairs are needed: a pair is computed the first
+    time it is used and cached for the rest of the rollout.
+    """
     device = b_obs.device
-    rollout_neural_probs = agent.get_policy_probs(b_obs).reshape(num_steps, num_envs, -1)
     has_successor = torch.arange(num_steps, device=device) < (num_steps - 1)
     transition_terminals = rollout_transition_terminals.bool()
 
-    psm_similarity_by_pair = {}
-    metric_mean_by_pair = {}
-    metric_means = []
-
-    for source_env in range(num_envs):
-        symbolic_x = rollout_symbolic_probs[:, source_env, :]
-        active_x = has_successor & (~transition_terminals[:, source_env])
-
-        for target_env in range(num_envs):
-            if target_env == source_env:
-                continue
-
-            neural_y = rollout_neural_probs[:, target_env, :]
+    def compute_metric(pair_key):
+        source_env, target_env = pair_key
+        with torch.no_grad():
+            symbolic_x = rollout_symbolic_probs[:, source_env, :]
+            active_x = has_successor & (~transition_terminals[:, source_env])
+            symbolic_y = rollout_symbolic_probs[:, target_env, :]
             active_y = has_successor & (~transition_terminals[:, target_env])
 
-            dist_matrix = total_variation_distance_matrix(symbolic_x, neural_y)
-            metric_matrix = compute_policy_similarity_metric_fixed_point(
+            dist_matrix = total_variation_distance_matrix(symbolic_x, symbolic_y)
+            return compute_policy_similarity_metric_fixed_point(
                 policy_distance_matrix=dist_matrix,
                 has_successor_x=active_x,
                 has_successor_y=active_y,
                 gamma=gamma,
                 dp_eps=dp_eps,
             )
-            pair_key = (source_env, target_env)
-            psm_similarity_by_pair[pair_key] = torch.exp(-metric_matrix / max(beta, 1e-8))
-            metric_mean_by_pair[pair_key] = metric_matrix.mean()
-            metric_means.append(metric_mean_by_pair[pair_key])
 
-    if metric_means:
-        rollout_metric_mean = torch.stack(metric_means).mean()
-    else:
-        rollout_metric_mean = b_obs.new_zeros(())
+    metric_by_pair = LazyPairCache(compute_metric)
+    psm_similarity_by_pair = LazyPairCache(lambda pair_key: torch.exp(-metric_by_pair[pair_key] / max(beta, 1e-8)))
+    metric_mean_by_pair = LazyPairCache(lambda pair_key: metric_by_pair[pair_key].mean())
 
-    return psm_similarity_by_pair, metric_mean_by_pair, rollout_metric_mean
+    return psm_similarity_by_pair, metric_mean_by_pair
 
 
 def compute_symbolic_to_neural_psm_auxiliary_loss(
@@ -203,50 +206,30 @@ def compute_symbolic_to_neural_psm_auxiliary_loss(
     b_obs,
     psm_similarity_by_pair,
     metric_mean_by_pair,
-    mb_inds,
+    source_env,
+    target_env,
     num_envs,
     num_steps,
     temperature,
-    pair_cycle_index,
 ):
-    """Computes PSM contrastive loss for one minibatch using the full rollout matrices.
+    """Computes PSM contrastive loss for one minibatch on the env pair (source_env, target_env).
 
-    mb_inds is used only for deterministic pair cycling; the loss itself operates
-    on the full (num_steps × num_steps) precomputed matrices, not a subset.
+    The loss operates on the full (num_steps × num_steps) rollout matrices of the pair,
+    not on the minibatch indices.
     """
-    if num_envs < 2 or not psm_similarity_by_pair:
+    if num_envs < 2 or psm_similarity_by_pair is None:
         zero = b_obs.new_zeros(())
-        return zero, zero, pair_cycle_index
+        return zero, zero
 
-    # Determine which env pair to use via deterministic cycling
-    mb_envs = torch.remainder(torch.as_tensor(mb_inds, dtype=torch.long), num_envs)
-    target_env_candidates = torch.unique(mb_envs).tolist()
-    if not target_env_candidates:
-        zero = b_obs.new_zeros(())
-        return zero, zero, pair_cycle_index
+    pair_key = (source_env, target_env)
 
-    target_slot = pair_cycle_index % len(target_env_candidates)
-    sampled_target_env = target_env_candidates[target_slot]
+    # Compute the learnable similarity s_theta from the policy's hidden
+    # representation passed through a small projection head.
+    src_obs_indices = torch.arange(num_steps, device=b_obs.device) * num_envs + source_env
+    tgt_obs_indices = torch.arange(num_steps, device=b_obs.device) * num_envs + target_env
 
-    source_env_candidates = [e for e in range(num_envs) if e != sampled_target_env]
-    if not source_env_candidates:
-        zero = b_obs.new_zeros(())
-        return zero, zero, pair_cycle_index
-    source_slot = (pair_cycle_index // max(1, len(target_env_candidates))) % len(source_env_candidates)
-    sampled_source_env = source_env_candidates[source_slot]
-
-    pair_key = (sampled_source_env, sampled_target_env)
-    if pair_key not in psm_similarity_by_pair:
-        zero = b_obs.new_zeros(())
-        return zero, zero, pair_cycle_index + 1
-
-    # Compute the learnable similarity s_theta from grounded vectors passed
-    # through a small auxiliary projection head.
-    src_obs_indices = torch.arange(num_steps, device=b_obs.device) * num_envs + sampled_source_env
-    tgt_obs_indices = torch.arange(num_steps, device=b_obs.device) * num_envs + sampled_target_env
-
-    src_embedding = agent.get_grounded_embedding(b_obs[src_obs_indices])
-    tgt_embedding = agent.get_grounded_embedding(b_obs[tgt_obs_indices])
+    src_embedding = agent.get_embedding(b_obs[src_obs_indices])
+    tgt_embedding = agent.get_embedding(b_obs[tgt_obs_indices])
     src_embedding = src_embedding / (src_embedding.norm(dim=-1, keepdim=True) + 1e-8)
     tgt_embedding = tgt_embedding / (tgt_embedding.norm(dim=-1, keepdim=True) + 1e-8)
     similarity_matrix = src_embedding @ tgt_embedding.T
@@ -258,7 +241,7 @@ def compute_symbolic_to_neural_psm_auxiliary_loss(
         temperature=temperature,
     )
 
-    return pair_loss, metric_mean_by_pair[pair_key], pair_cycle_index + 1
+    return pair_loss, metric_mean_by_pair[pair_key]
 
 
 class Agent(nn.Module):
@@ -273,14 +256,16 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor = nn.Sequential(
+        # Same layers and initialisation as the PPO actor, split so that the PSM
+        # embedding is computed from the hidden representation used by the policy.
+        self.actor_trunk = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
         )
-        self.grounded_projection = nn.Sequential(
+        self.actor_head = layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01)
+        self.projection = nn.Sequential(
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64), std=1.0),
@@ -294,16 +279,20 @@ class Agent(nn.Module):
 
     def get_policy_probs(self, x):
         """Returns learned action probabilities pi(a|s)."""
-        return torch.softmax(self.actor(x), dim=-1)
+        return torch.softmax(self.actor_head(self.actor_trunk(x)), dim=-1)
 
     def get_grounded_vectors(self, x):
         """Returns deterministic grounded predicate vectors from observables."""
         grounded_vectors = get_grounded_predicate_vectors(x[:, 4:])
         return torch.as_tensor(grounded_vectors, device=x.device, dtype=x.dtype)
 
-    def get_grounded_embedding(self, x):
-        """Returns a learnable projection of grounded vectors for the PSM loss."""
-        return self.grounded_projection(self.get_grounded_vectors(x))
+    def get_embedding(self, x):
+        """Returns the PSM embedding: a projection of the policy's hidden representation.
+
+        Gradients of the PSM loss flow into actor_trunk, i.e. into the policy itself
+        (Agarwal et al., 2021, policy similarity embeddings).
+        """
+        return self.projection(self.actor_trunk(x))
 
     def get_symbolic_probs(self, x):
         """Builds symbolic action distributions from rule-based observables.
@@ -319,8 +308,12 @@ class Agent(nn.Module):
                     symbolic_probs[batch_idx, suggested_action] = self.conf_level
         return symbolic_probs / symbolic_probs.sum(dim=-1, keepdim=True)
 
+    def actor(self, x):
+        """Policy logits, as the `actor` module of the other agents (used by the evaluation scripts)."""
+        return self.actor_head(self.actor_trunk(x))
+
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        logits = self.actor_head(self.actor_trunk(x))
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
@@ -344,7 +337,7 @@ if __name__ == "__main__":
             name=run_name,
             monitor_gym=True,
             save_code=True,
-            group=f"h_ppo_PSM_{args.group_name}"
+            group=f"h_ppo_psm_sym_{args.group_name}"
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -356,6 +349,8 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    # Separate generator for the PSM env pairs, so that it does not shift the other random streams.
+    psm_pair_rng = np.random.default_rng(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
@@ -467,7 +462,6 @@ if __name__ == "__main__":
         psm_cme_running = torch.tensor(0.0, device=device)
         psm_metric_running = torch.tensor(0.0, device=device)
         psm_cme_count = 0
-        psm_pair_cycle_index = 0
 
         if args.psm_aux_coef > 0:
             with torch.no_grad():
@@ -477,7 +471,6 @@ if __name__ == "__main__":
                 (
                     rollout_psm_similarity_by_pair,
                     rollout_metric_mean_by_pair,
-                    _,
                 ) = precompute_symbolic_to_neural_psm_rollout_cache(
                     agent=agent,
                     b_obs=b_obs,
@@ -540,16 +533,18 @@ if __name__ == "__main__":
                     and rollout_psm_similarity_by_pair is not None
                     and rollout_metric_mean_by_pair is not None
                 ):
-                    mb_psm_cme_loss, mb_psm_metric_mean, psm_pair_cycle_index = compute_symbolic_to_neural_psm_auxiliary_loss(
+                    # One ordered pair of distinct envs per minibatch, uniformly at random.
+                    psm_source_env, psm_target_env = psm_pair_rng.choice(args.num_envs, size=2, replace=False).tolist()
+                    mb_psm_cme_loss, mb_psm_metric_mean = compute_symbolic_to_neural_psm_auxiliary_loss(
                         agent,
                         b_obs,
                         rollout_psm_similarity_by_pair,
                         rollout_metric_mean_by_pair,
-                        mb_inds,
+                        psm_source_env,
+                        psm_target_env,
                         num_envs=args.num_envs,
                         num_steps=args.num_steps,
                         temperature=args.psm_temperature,
-                        pair_cycle_index=psm_pair_cycle_index,
                     )
                     psm_cme_running = psm_cme_running + mb_psm_cme_loss.detach()
                     psm_metric_running = psm_metric_running + mb_psm_metric_mean.detach()
@@ -587,8 +582,8 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", sps, global_step)
 
     if args.save_model:
-        os.makedirs(f"models/h_ppo_PSM_{args.size_env}x{args.size_env}_{args.n_keys}keys{args.run_code}", exist_ok=True)
-        model_path = f"models/h_ppo_PSM_{args.size_env}x{args.size_env}_{args.n_keys}keys{args.run_code}/h_ppo_PSM_seed={args.seed}.pt"
+        os.makedirs(f"models/h_ppo_psm_sym_{args.size_env}x{args.size_env}_{args.n_keys}keys{args.run_code}", exist_ok=True)
+        model_path = f"models/h_ppo_psm_sym_{args.size_env}x{args.size_env}_{args.n_keys}keys{args.run_code}/h_ppo_psm_sym_seed={args.seed}.pt"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
         # Prevent tyro in the evaluation module from parsing the training CLI args
@@ -605,7 +600,7 @@ if __name__ == "__main__":
                 eval_episodes=1000,
                 run_name=f"{run_name}-eval",
                 seed=args.seed,
-                group_name=f"h_ppo_PSM_{args.group_name}_evals",
+                group_name=f"h_ppo_psm_sym_{args.group_name}_evals",
                 Model=Agent,
                 device=device,
                 track=False,

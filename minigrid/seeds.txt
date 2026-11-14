@@ -1,2 +1,2 @@
-The seeds that were used to train the models are:
-70, 50, 95, 200, 700
+The seeds used to train and evaluate the models of the paper are:
+50, 70, 95, 200, 700

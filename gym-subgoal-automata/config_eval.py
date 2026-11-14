@@ -54,10 +54,30 @@ class Args:
     if delta > threshold the network is improving enough, so we let it cook.
     0.0 = old behaviour (any positive increase skips rules); increase to require a larger improvement"""
 
+    num_layouts: int = 1
+    """number of map layouts (environment seeds) per master seed; eval_episodes are split evenly among them.
+    1 = old behaviour (a single layout, environment_seed = master seed)"""
+
+    layout_mode: str = "train"
+    """'train': layouts environment_seed = master_seed + k, k < num_layouts, i.e. the layouts of the parallel
+    training environments of that checkpoint (training uses seeds seed + i, i < num_envs);
+    'unseen': layouts never used in training, environment_seed = unseen_seed_offset + 1000 * run_index + k"""
+
+    unseen_seed_offset: int = 10_000_000
+    """offset of the environment seeds used by layout_mode='unseen' (far from every training seed)"""
+
+    log_rule_stats: bool = False
+    """log, for every episode, the number of steps, the steps where the rules suggest an action,
+    and the steps where the executed action is one of the suggested ones (activation rate)"""
+
+    output_root: str = ""
+    """root folder of the results; default: aggregate_evals (or aggregate_evals_logs for < 1000 episodes),
+    and aggregate_evals_multilayout when num_layouts > 1, layout_mode='unseen' or log_rule_stats is set"""
+
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
-    track: bool = True
+    track: bool = False
     """whether to track the experiment with wandb"""
 
     wandb_project_name: str = WANDB_PROJECT_NAME
