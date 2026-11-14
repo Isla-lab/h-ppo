@@ -65,9 +65,8 @@ Training logs to TensorBoard (`runs/`). Weights & Biases tracking is off by defa
 ## Running the experiments
 
 `scripts/train.sh` and `scripts/eval.sh` run any combination of source task, method, target task and evaluation
-protocol with the hyperparameters of the paper (Table 2). They use the Python environment of the folder
-(`.venv/bin/python`, or the one given in `PYTHON`); `DRY_RUN=1` prints the commands without running them.
-No trained models are included: train a method first, then evaluate it.
+protocol with the hyperparameters of the paper (Table 2).
+**No trained models are included: train them first and then evaluate.**
 
 | Argument | Values |
 | --- | --- |
@@ -84,7 +83,7 @@ bash scripts/train.sh deliver_coffee psm 70 75         # H-PPO-PSM on DeliverCof
 ```
 
 A model is saved in `<folder>/models/<model_name>_<task>/<model_name>_seed=<seed>.pt` and training logs go to
-TensorBoard (`runs/`). The trained models of the paper are available from the authors on request.
+TensorBoard (`runs/`).
 
 **Evaluation.** The five seeds of a trained model, 1000 episodes each, on one target task under one protocol:
 
@@ -95,9 +94,7 @@ bash scripts/eval.sh doorkey ppo 8x8_4keys sr --epsilon 0.5     # extra argument
 ```
 
 The return of every episode is written to a CSV in `minigrid/aggregate_evals/` or
-`gym-subgoal-automata/aggregate_evals_multilayout/`; an episode is successful when its return is positive. As in the
-paper, the OfficeWorld tasks are evaluated on the 8 layouts of training and the WaterWorld tasks on 100
-configurations never seen in training. All the arguments of the evaluation, with their defaults, are in
+`gym-subgoal-automata/aggregate_evals_multilayout/`. All the arguments of the evaluation, with their defaults, are in
 `config_eval.py`.
 
 **Without the scripts.** The scripts call the Python files directly, from their folder, for example:
@@ -109,7 +106,7 @@ python aggregate_eval.py --master_seeds 50 70 95 200 700 --size_env_model 8 --n_
     --size_env 16 --n_keys 2 --model_name h_ppo_symloss --run_code '' --eval_type random_rules
 ```
 
-## Licence
+## License
 
 MIT (see `LICENSE`). The OfficeWorld and WaterWorld environments come from gym-subgoal-automata by Daniel
 Furelos-Blanco and keep their own MIT licence (`gym-subgoal-automata/LICENSE`). The PPO implementation is adapted
